@@ -1,0 +1,129 @@
+---
+title: "Twilight Annotation"
+format: html
+editor: visual
+---
+
+## When was twilight?
+
+The workflow recommended by [Lisovski et al.](https://geolocationmanual.vogelwarte.ch/) in their geolocation user manual relies on `TwGeos::preprocessLight()`, which I can't get to work with the Adélie penguin data. So I want to try a different approach using change point analysis.
+
+## Load packages and data
+
+```{r}
+#| label: setup
+
+library(lubridate)
+library(TwGeos)
+library(tidyverse)
+
+move_1947021 <- read_csv("data/gls/1947021.csv")
+lightraw <- move_1947021 %>% 
+  select(Date = timestamp,
+         Light = `gls:light-level`) %>% 
+  slice(seq(1, nrow(.), by = 5))
+
+```
+
+## Diagnostic plots
+
+```{r}
+#| label: diagnostic-lightimage
+
+# Time offset and calibration location
+offset <- -6
+lon.calib <- -64.1
+lat.calib <- -64.8
+
+# Create a light image plot
+lightImage(tagdata = lightraw,
+           offset = offset,     
+           zlim = c(0, 10))
+
+# Add twilight times for the calibration location
+tm <- seq(min(lightraw$Date), max(lightraw$Date), by = "day")
+rise <- rep(c(TRUE, FALSE), length(tm))
+zenith = 96
+c.dat <- data.frame(
+  Twilight = SGAT::twilight(rep(tm, each = 2), 
+                            lon = lon.calib, lat = lat.calib, 
+                            rise = rise, zenith = zenith), 
+  Rise = rise
+)
+tsimageLines(c.dat$Twilight[c.dat$Rise], offset = offset, 
+             lwd = 3, col = adjustcolor("orange", alpha.f = 0.5))
+tsimageLines(c.dat$Twilight[!c.dat$Rise], offset = offset,
+             lwd = 3, col = adjustcolor("orange", alpha.f = 0.5))
+
+```
+
+The light data look very noisy until 2020-02-11, so we'll begin our analysis then.
+
+```{r}
+#| label: diagnostic-threshold
+
+sample_begin <- as.POSIXct("2020-03-20", tz = "UTC")
+sample_end <- as.POSIXct("2020-03-30", tz = "UTC")
+threshold <- 1
+filter(lightraw, between(Date, sample_begin, sample_end)) %>% 
+  ggplot(aes(x = Date, y = Light)) +
+  geom_line() +
+  geom_point(aes(color = Light)) +
+  geom_hline(yintercept = threshold, linetype = "dashed", color = "red") +
+  scale_y_continuous(trans = "pseudo_log", 
+                     breaks = 10^(0:5)) +
+  scale_color_gradientn(colors = c('black',"purple",'orange'),
+                        trans = "pseudo_log", 
+                        breaks = 10^(0:5)) +
+  theme_classic()
+
+```
+
+This sample of 10 days in late March suggests a light threshold of 1 (red dotted line) is appropriate. Some nights look very clean (e.g., Mar 26) while others are very noisy (e.g., Mar 24).
+
+## Twilight estimates
+
+I'll try to estimate twilight times using changepoint analysis.
+
+```{r}
+#| label: twilight-changepoint
+
+light <- lightraw %>% 
+  filter(Date >= as.POSIXct("2020-02-11", tz = "UTC")) %>% 
+  mutate(is_light = ifelse(Light > threshold, 1, 0))
+
+find_twilights <- function(light, light_thr) {
+  is_light <- light > light_thr
+  light_cpt <- changepoint::cpt.mean(light,)
+}
+
+rise_set <- SGAT::twilight(
+  tm = rep(light$Date[1], 2),
+  lon = lon.calib,
+  lat = lat.calib,
+  rise = c(TRUE, FALSE)
+)
+if (rise_set[1] > rise_set[2]) 
+  rise_set[1] <- rise_set[1] + days(1)
+noon <- rise_set[1] + (rise_set[2] - rise_set[1]) / 2
+light_1day <- light %>% 
+  filter(between(Date, noon - hours(13), noon + hours(13)))
+
+light_cpt <- changepoint::cpt.mean(light_1day$is_light, 
+                                   method = "PELT", 
+                                   Q = 3)
+twilights_1day <- data.frame(
+  riseset = c("Sunrise", "Sunset"),
+  Date = light_1day$Date[light_cpt@cpts[1:2]]
+)
+
+ggplot(light_1day, aes(Date, is_light)) + 
+  geom_line() +
+  geom_vline(aes(xintercept = Date, color = riseset), 
+             twilights_1day,
+             linewidth = 2) +
+  scale_color_manual(values = c("goldenrod", "blue4")) +
+  theme_classic() +
+  theme(legend.position = "top",
+        legend.title = element_blank())
+```
